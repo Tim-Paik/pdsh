@@ -6,15 +6,55 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
+	"time"
 )
 
+var (
+	Username string
+	Hostname string
+)
+
+//非Windows编译请注释下面的var和winColorPrint里的proc，以及上面import的"syscall"
+var (
+	kernel32 *syscall.LazyDLL  = syscall.NewLazyDLL(`kernel32.dll`)
+	proc     *syscall.LazyProc = kernel32.NewProc(`SetConsoleTextAttribute`)
+)
+
+func winColorPrint(s string, i int) {
+	proc.Call(uintptr(syscall.Stdout), uintptr(i))
+	fmt.Print(s)
+	proc.Call(uintptr(syscall.Stdout), uintptr(7))
+}
+
+func init() {
+	if userInfo, err := user.Current(); err != nil {
+		os.Exit(2)
+		return
+	} else {
+		switch runtime.GOOS {
+		case "windows":
+			Username = userInfo.Name
+		default:
+			Username = userInfo.Username
+		}
+	}
+	if hostname, err := os.Hostname(); err != nil {
+		return
+	} else {
+		Hostname = hostname
+	}
+}
+
 func main() {
-	fmt.Printf("Pdsh v0.0.3\nCopyright 2020 Tim_Paik @ Pd2 All rights reserved.\n")
+	fmt.Printf("Pdsh v0.0.4\nCopyright 2020 Tim_Paik @ Pd2 All rights reserved.\n")
+	input := bufio.NewReader(os.Stdin)
 	for {
 		PrintPwd()
-		input := bufio.NewReader(os.Stdin)
 		if line, isPrefix, err := input.ReadLine(); err != nil {
 			if err == io.EOF {
 				os.Exit(1)
@@ -50,25 +90,33 @@ func main() {
 						execCmd.Path = lp
 					}
 				}
-				var stdout, stderr []byte
-				var errStdout, errStderr error
+				var /*errStdin,*/ errStdout, errStderr error
+				//stdinIn, _ := execCmd.StdinPipe()
 				stdoutIn, _ := execCmd.StdoutPipe()
 				stderrIn, _ := execCmd.StderrPipe()
 				if err := execCmd.Start(); err != nil {
 					PrintError(err)
 					continue
 				}
+				isClose := false
+				/*
+					go func() {
+						errStdin = Write(os.Stdin, stdinIn, &isClose)
+					}()
+				*/
 				go func() {
-					stdout, errStdout = copyAndCapture(os.Stdout, stdoutIn)
+					errStdout = Read(stdoutIn, os.Stdout, &isClose)
 				}()
 				go func() {
-					stderr, errStderr = copyAndCapture(os.Stderr, stderrIn)
+					errStderr = Read(stderrIn, os.Stderr, &isClose)
 				}()
 				if err := execCmd.Wait(); err != nil {
+					isClose = true
 					PrintError(err)
 					continue
 				}
-				if errStdout != nil || errStderr != nil {
+				isClose = true
+				if errStdout != nil || errStderr != nil /*|| errStdin != nil*/ {
 					PrintError(fmt.Errorf("failed to capture stdout or stderr\n"))
 				}
 			}
@@ -81,7 +129,19 @@ func PrintPwd() {
 		PrintError(err)
 		return
 	} else {
-		fmt.Printf("\n# " + pwd + "\n$ ")
+		//fmt.Printf("\n# " + pwd + "\n$ ")
+		switch runtime.GOOS {
+		case "windows":
+			fmt.Printf("\n")
+			winColorPrint("# ", 1)
+			fmt.Printf("%s @ ", Username)
+			winColorPrint(Hostname, 2)
+			fmt.Printf(" in %s [%s]\n", pwd, time.Now().Format("15:04:05"))
+			winColorPrint("$ ", 4)
+		default:
+			//fmt.Printf(pwd)
+			fmt.Printf("\n\033[34m# \033[0m%s @ \033[32m%s\033[0m in \033[33m%s\033[0m [%s]\n\033[31m$\033[0m ", Username, Hostname, pwd, time.Now().Format("15:04:05"))
+		}
 	}
 }
 
@@ -92,24 +152,48 @@ func PrintError(err error) {
 	}
 }
 
-func copyAndCapture(w io.Writer, r io.Reader) ([]byte, error) {
-	var out []byte
-	buf := make([]byte, 1024, 1024)
+func Read(from io.Reader, to io.Writer, isClose *bool) (err error) {
 	for {
-		n, err := r.Read(buf[:])
-		if n > 0 {
-			d := buf[:n]
-			out = append(out, d...)
-			if _, err := os.Stdout.Write(d); err != nil {
-				return nil, err
-			}
+		if *isClose == true {
+			return nil
 		}
-		if err != nil {
-			// Read returns io.EOF at the end of file, which is not an error for us
+		buf := make([]byte, 1024, 1024)
+		if n, err := from.Read(buf[:]); err != nil {
 			if err == io.EOF {
-				err = nil
+				return nil
 			}
-			return out, err
+			return err
+		} else {
+			if n > 0 {
+				if _, err := to.Write(buf[:n]); err != nil {
+					return err
+				}
+			}
 		}
+		return nil
+	}
+}
+
+func Write(from io.Reader, to io.Writer, isClose *bool) (err error) {
+	for {
+		if *isClose == true {
+			return nil
+		}
+		buf := make([]byte, 1024, 1024)
+		if n, err := from.Read(buf[:]); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		} else {
+			if n > 0 {
+				if _, err := to.Write(buf[:n]); err != nil {
+					return err
+				}
+			} else if n == 0 {
+				continue
+			}
+		}
+		return nil
 	}
 }
